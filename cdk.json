@@ -19,6 +19,7 @@
     "@aws-cdk/aws-iam:minimizePolicies": true,
     "@aws-cdk/aws-s3:createDefaultLoggingPolicy": true,
     "@aws-cdk/aws-s3:serverAccessLogsUseBucketPolicy": true,
-    "@aws-cdk/aws-sqs:queueRedrivePolicyUseQueueUrl": true
+    "@aws-cdk/aws-sqs:queueRedrivePolicyUseQueueUrl": true,
+    "@aws-cdk/customresources:installLatestAwsSdkDefault": false
   }
 }
