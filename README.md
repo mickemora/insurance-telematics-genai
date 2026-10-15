@@ -9,7 +9,29 @@ is defined in **AWS CDK (Python)**, and uses **synthetic data only**.
 | 1 | Foundation: synthetic trip generator, rule-based scoring, weekly aggregates | ✅ done |
 | 2 | Score explainer and coach (Claude on Bedrock + Guardrail) behind an API | ✅ done |
 | 3 | Possible crash → triage → member statement → FNOL draft (EventBridge + Step Functions + Bedrock) | ✅ done |
-| 4 | Demo UI, agent copilot, demo script | planned |
+| 4 | Web app (CloudFront + passcode), Amazon Bedrock Agent copilot, demo script | ✅ done |
+
+## The whole thing
+
+```mermaid
+flowchart LR
+    U[Browser] -->|passcode| CF[CloudFront]
+    CF -->|/| S3W[(S3 web app)]
+    CF -->|/api/* + API key| AG[API Gateway]
+    AG --> API[API Lambda]
+    API --> DDB[(DynamoDB)]
+    API --> BR[Claude on Bedrock<br/>+ Guardrail]
+    API -->|async job| W[Copilot worker]
+    W --> AGENT[Bedrock Agent]
+    AGENT -->|read-only tools| T[Agent tools Lambda] --> DDB
+    GEN[Generator] --> S3R[(S3 raw trips)] --> Q[SQS] --> SC[Scoring] --> DDB
+    SC -->|crash event| EB{{EventBridge}} --> SF[Step Functions<br/>claims workflow]
+    SF --> BR
+    SF --> DDB
+    API -.->|statement resumes| SF
+```
+
+The demo talk track is in [docs/demo-script.md](docs/demo-script.md).
 
 ## Architecture (Day 1)
 
@@ -167,6 +189,59 @@ Claims live in the same table under partition key `CLAIMS`, with the claim id as
 the sort key. Claim ids derive from the trip id, so duplicate events never open
 two claims.
 
+## Day 4: web app and Bedrock Agent copilot
+
+**Web app.** One CloudFront URL serves the static site (S3, private, origin access
+control) and proxies `/api/*` to API Gateway. A CloudFront Function checks a
+username and password (HTTP basic auth) on every request and strips the `/api`
+prefix. CloudFront adds the API key as an origin header from Secrets Manager, so
+the key never reaches the browser. The app is plain HTML, CSS, and JavaScript
+with Chart.js from a CDN, so there is no build step.
+
+- **Drivers:** score as a road-sign plate, weekly chart, points lost per factor,
+  recent trips, and *Explain this score with AI* with the facts the model saw.
+- **Claims:** triage, a lane-strip timeline of what the phone recorded, the
+  member message, a statement form (with truthful and inconsistent examples),
+  the FNOL draft, and a link to the run in the Step Functions console.
+- **Copilot:** chat with the Bedrock Agent; *How it answered* lists every tool
+  call and the agent's reason for it.
+
+```bash
+cdk deploy -c site_password='pick-something'   # user defaults to "demo" (-c site_user=...)
+make site                                       # prints the URL
+```
+
+Without `site_password` the stack deploys with the default `telematics-demo` and
+CDK prints a warning. The credentials end up in the CloudFront Function code,
+which is fine for a demo gate but is not real authentication; use Cognito for
+anything beyond a demo.
+
+**Copilot (Amazon Bedrock Agent).** `CfnAgent` with the same model and guardrail
+as Days 2 and 3, and one action group, `TelematicsData`, defined with function
+schemas and backed by a Lambda that reuses the API's data access:
+
+| Tool | Returns |
+|---|---|
+| `list_drivers` | every driver with latest score, band, and change |
+| `get_driver_score(driver_id)` | weekly scores and points lost per factor |
+| `get_driver_trips(driver_id, limit)` | most recent trips with points lost and event counts |
+| `get_score_explanation(driver_id)` | the Day 2 explanation (cached) |
+| `list_claims(status)` | claims with triage and verdict |
+| `get_claim(claim_id)` | crash facts, statement checks, and the FNOL draft |
+
+All tools are read-only. Agents can take longer than API Gateway's 29-second
+limit, so `POST /copilot` stores a job and invokes a worker Lambda asynchronously,
+and the client polls `GET /copilot/{job_id}`. The worker calls `InvokeAgent` with
+tracing on and stores the answer, every tool call with the agent's rationale,
+token usage, and whether the guardrail intervened. The worker uses the built-in
+`TSTALIASID` alias (the agent's working draft), which `auto_prepare` refreshes on
+every deploy; a versioned alias would need a new version for every change.
+
+```bash
+make ask Q="Which drivers dropped the most this week, and why?"
+python scripts/demo.py ask "And what should I tell them?" --session cli-1234567890
+```
+
 ## Prerequisites
 
 - AWS account and credentials (`aws sts get-caller-identity` works)
@@ -175,6 +250,8 @@ two claims.
 - CDK bootstrapped once per account/region: `cdk bootstrap`
 - Day 2: access to the Claude model in Amazon Bedrock for your region (check with
   `aws bedrock list-inference-profiles`)
+- Day 4: Amazon Bedrock Agents in your region, with a model that Agents supports
+  (switch with `-c bedrock_model_id=...` if the agent fails to prepare)
 
 ## Deploy, run, destroy
 
@@ -200,7 +277,11 @@ python scripts/demo.py statement CLM-XXXXXXXX                 # truthful stateme
 python scripts/demo.py statement CLM-XXXXXXXX --inconsistent  # contradicts the data -> flagged
 make eval-claims                        # triage + cross-check vs ground truth (right after generate)
 
+make site                               # Day 4: web app URL (sign in with your site_password)
+make ask Q="Summarize DRV-0020's last 10 trips"   # Day 4: Bedrock Agent copilot from the terminal
+
 cdk destroy      # removes everything, including bucket contents and logs
+make verify-clean   # confirm nothing tagged with the project is left
 ```
 
 `make generate` resets previous data by default. Options:
@@ -215,7 +296,21 @@ Pay-per-use only: Lambda, S3, SQS, DynamoDB on-demand, EventBridge, API
 Gateway, Bedrock, Guardrails, Step Functions, and Amazon Location. A full generate run costs well under $0.10.
 A full `make eval` (20 explanations of roughly 2,000 tokens each, plus 20
 guardrail checks) costs a few cents with Haiku. A Day 3 run is a handful of
-state transitions, 3 reverse geocodes, and 3 claim drafts: well under $0.05. Nothing runs between invocations, and
+state transitions, 3 reverse geocodes, and 3 claim drafts: well under $0.05.
+
+Day 4 adds CloudFront (requests and transfer, pennies for a demo), one Secrets
+Manager secret (about $0.40 a month, prorated while deployed), and Bedrock Agent
+calls: a copilot question typically takes 2 to 4 model calls of a few thousand
+tokens each, so a few cents per 10 questions with Haiku.
+
+| Left running for a month, idle | Roughly |
+|---|---|
+| Secrets Manager secret | $0.40 |
+| Everything else (on demand, no traffic) | $0 to $1 |
+
+`make verify-clean` after `cdk destroy` lists anything still tagged with the
+project. The secret can show as pending deletion during Secrets Manager's recovery
+window, and CDK's own helper Lambdas can leave empty log groups behind. Nothing runs between invocations, and
 `cdk destroy` leaves nothing behind (the CDK bootstrap stack is shared and
 stays).
 
@@ -228,9 +323,12 @@ lambdas/generator/           synth.py (pure generator) + handler.py
 lambdas/scoring/             handler.py (S3 -> SQS -> score -> DynamoDB + EventBridge)
 lambdas/shared/python/       Lambda layer: score.py, facts.py (explainer), crash.py (claims), llm.py (Bedrock)
 lambdas/api/                 handler.py (routes) + explain.py (Bedrock, validation, fallback)
+                             agent_tools.py (Bedrock Agent action group) + copilot_worker.py
 lambdas/claims/              handlers.py (4 workflow tasks) + draft.py (FNOL draft, validation, fallback)
+web/                         index.html, styles.css, app.js (no build step)
+docs/demo-script.md          10-minute talk track
 scripts/demo.py              generate / scores / trips / crashes / explain / eval / claims / claim /
-                             statement / eval-claims / local
+                             statement / eval-claims / site / ask / verify-clean / local
 tests/                       pytest: scoring, generator, facts + explainer, handlers (fakes), CDK template
 ```
 

@@ -7,13 +7,17 @@ GET /drivers/{driver_id}/explanation[?refresh=true]
 GET  /claims                        claims opened by the crash workflow (Day 3)
 GET  /claims/{claim_id}             one claim: crash facts, triage, statement, FNOL draft
 POST /claims/{claim_id}/statement   member statement {"statement": "..."}; resumes the workflow
+POST /copilot                       {"question": "...", "session_id": "..."} -> 202 {"job_id"} (Day 4)
+GET  /copilot/{job_id}              copilot job status, answer, and the agent's tool calls
 """
 from __future__ import annotations
 
 import json
 import logging
 import os
-from datetime import datetime, timezone
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
 
 import boto3
 from botocore.config import Config
@@ -33,6 +37,9 @@ GUARDRAIL_VERSION = os.environ.get("GUARDRAIL_VERSION") or None
 RECENT_TRIPS = 10
 CLAIMS_PK = "CLAIMS"
 MAX_STATEMENT_CHARS = 1000
+COPILOT_PK = "COPILOT"
+MAX_QUESTION_CHARS = 1000
+SESSION_ID = re.compile(r"^[0-9a-zA-Z._:-]{2,100}$")
 
 table = boto3.resource("dynamodb").Table(TABLE)
 bedrock = boto3.client(
@@ -40,6 +47,7 @@ bedrock = boto3.client(
     config=Config(read_timeout=25, connect_timeout=5, retries={"max_attempts": 2, "mode": "standard"}),
 )
 sfn = boto3.client("stepfunctions")
+lambda_client = boto3.client("lambda")
 
 
 # --------------------------------------------------------------------------- data access
@@ -255,6 +263,46 @@ def post_statement(claim_id: str, raw_body: str | None) -> dict:
                             "message": "Statement received; the FNOL draft is being prepared."})
 
 
+# --------------------------------------------------------------------------- copilot (Day 4)
+
+def post_copilot(raw_body: str | None) -> dict:
+    worker = os.environ.get("COPILOT_WORKER_FUNCTION")
+    if not worker:
+        return _response(501, {"message": "the copilot is not deployed"})
+    try:
+        body = json.loads(raw_body or "{}")
+        question = str(body.get("question", "")).strip()
+        session_id = str(body.get("session_id") or uuid.uuid4())
+    except (ValueError, AttributeError):
+        return _response(400, {"message": 'body must be JSON like {"question": "..."}'})
+    if not question:
+        return _response(400, {"message": "question is required"})
+    if len(question) > MAX_QUESTION_CHARS:
+        return _response(400, {"message": f"question is limited to {MAX_QUESTION_CHARS} characters"})
+    if not SESSION_ID.match(session_id):
+        return _response(400, {"message": "session_id may use letters, digits, and . _ : - (2-100 chars)"})
+    job_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc)
+    table.put_item(Item={
+        "driver_id": COPILOT_PK, "sk": job_id, "entity": "copilot_job", "status": "queued",
+        "question": question, "session_id": session_id, "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "expires_at": int((now + timedelta(days=1)).timestamp()),
+    })
+    lambda_client.invoke(FunctionName=worker, InvocationType="Event", Payload=json.dumps({"job_id": job_id}).encode())
+    return _response(202, {"job_id": job_id, "session_id": session_id, "status": "queued"})
+
+
+def get_copilot(job_id: str) -> dict:
+    item = table.get_item(Key={"driver_id": COPILOT_PK, "sk": job_id}).get("Item")
+    if not item:
+        return _response(404, {"message": f"job {job_id} not found"})
+    item = plain(item)
+    out = {k: item.get(k) for k in ("status", "question", "session_id", "created_at", "finished_at", "latency_ms")}
+    out["job_id"] = job_id
+    out.update(item.get("result") or {})
+    return _response(200, out)
+
+
 def handler(event, context):
     resource = event.get("resource", "")
     params = event.get("pathParameters") or {}
@@ -263,6 +311,10 @@ def handler(event, context):
     try:
         if method == "POST" and resource == "/claims/{claim_id}/statement":
             return post_statement(params["claim_id"], event.get("body"))
+        if method == "POST" and resource == "/copilot":
+            return post_copilot(event.get("body"))
+        if method == "GET" and resource == "/copilot/{job_id}":
+            return get_copilot(params["job_id"])
         if method != "GET":
             return _response(405, {"message": "method not allowed"})
         if resource == "/claims":

@@ -11,6 +11,9 @@
     python scripts/demo.py claim CLM-1A2B3C4D  # Day 3: one claim with its FNOL draft
     python scripts/demo.py statement CLM-1A2B3C4D [--inconsistent | --text "..."]
     python scripts/demo.py eval-claims         # Day 3: triage + statement checks vs ground truth
+    python scripts/demo.py site                # Day 4: web app URL and passcode user
+    python scripts/demo.py ask "Summarize DRV-0020's last 10 trips"   # Day 4: Bedrock Agent copilot
+    python scripts/demo.py verify-clean        # after `cdk destroy`: anything left behind?
     python scripts/demo.py local               # same pipeline offline, no AWS needed
 
 AWS commands use your normal AWS credentials/region (AWS_PROFILE, AWS_REGION)
@@ -480,6 +483,75 @@ def cmd_eval_claims(args) -> None:
             print(f"  fallback {r[0]}: {r[7]}")
 
 
+# --------------------------------------------------------------------------- Day 4
+
+def cmd_site(args) -> None:
+    out = stack_outputs()
+    if "SiteUrl" not in out:
+        sys.exit("The stack has no web app yet. Run `cdk deploy` to add the Day 4 resources.")
+    print(f"Web app:  {out['SiteUrl']}")
+    print(f"User:     {out['SiteUser']}")
+    print("Password: the site_password you deployed with (default: telematics-demo)")
+
+
+def cmd_ask(args) -> None:
+    session = args.session or f"cli-{int(time.time())}"
+    job = api_post("/copilot", {"question": args.question, "session_id": session})
+    print(f"Asking the copilot (session {session})", end="", flush=True)
+    deadline = time.time() + 180
+    while True:
+        r = api_get(f"/copilot/{job['job_id']}")
+        if r["status"] in ("done", "error") or time.time() > deadline:
+            break
+        print(".", end="", flush=True)
+        time.sleep(2)
+    print("\n")
+    if r["status"] != "done":
+        sys.exit(f"Copilot {r['status']}: {r.get('error', 'no answer yet')}")
+    print(r["answer"])
+    print(f"\n{len(r['tool_calls'])} lookups, {r['latency_ms'] / 1000:.1f} s, "
+          f"{r['usage'].get('inputTokens', 0):,} in / {r['usage'].get('outputTokens', 0):,} out tokens, "
+          f"guardrail {r['guardrail']}")
+    for n, c in enumerate(r["tool_calls"], 1):
+        params = ", ".join(f"{k}={v}" for k, v in (c.get("parameters") or {}).items())
+        print(f"  {n}. {c['function']}({params})")
+        if c.get("why"):
+            print(_wrap(c["why"], "     ", 92))
+    print(f"\nFollow up in the same conversation with: --session {session}")
+
+
+def cmd_verify_clean(args) -> None:
+    """After `cdk destroy`: list anything still tagged with this project, plus leftover log groups."""
+    boto3 = _boto3()
+    cfn = boto3.client("cloudformation")
+    try:
+        status = cfn.describe_stacks(StackName=STACK_NAME)["Stacks"][0]["StackStatus"]
+        print(f"Stack {STACK_NAME} still exists ({status}). Run `cdk destroy` first.")
+    except Exception:  # noqa: BLE001
+        print(f"Stack {STACK_NAME}: gone")
+    tagging = boto3.client("resourcegroupstaggingapi")
+    leftovers = []
+    for page in tagging.get_paginator("get_resources").paginate(
+            TagFilters=[{"Key": "project", "Values": ["insurance-telematics-genai"]}]):
+        leftovers += [r["ResourceARN"] for r in page["ResourceTagMappingList"]]
+    print(f"Resources tagged project=insurance-telematics-genai: {len(leftovers)}")
+    for arn in leftovers:
+        note = "  (Secrets Manager deletes this after its recovery window)" if ":secretsmanager:" in arn else ""
+        print(f"  {arn}{note}")
+    logs_client = boto3.client("logs")
+    groups = []
+    for prefix in (f"/aws/lambda/{STACK_NAME}", f"/aws/events/{STACK_NAME}", f"/aws/vendedlogs/states/{STACK_NAME}"):
+        for page in logs_client.get_paginator("describe_log_groups").paginate(logGroupNamePrefix=prefix):
+            groups += [g["logGroupName"] for g in page["logGroups"]]
+    print(f"Log groups left by CDK helper functions: {len(groups)}")
+    for g in groups:
+        print(f"  {g}")
+    if groups:
+        print("  These are created by CDK's own helper Lambdas (auto-delete, bucket deployment) and cost nothing")
+        print("  at rest. Remove them with: aws logs delete-log-group --log-group-name <name>")
+    print("\nThe CDK bootstrap stack (CDKToolkit) is shared by all CDK apps and is intentionally kept.")
+
+
 def cmd_local(args) -> None:
     data = synth_generate(drivers=args.drivers, days=args.days, seed=args.seed,
                           crashes=args.crashes, false_alarms=args.false_alarms)
@@ -560,6 +632,14 @@ def main() -> None:
     st.set_defaults(func=cmd_statement)
     sub.add_parser("eval-claims", help="check triage and statement cross-checks against ground truth"
                    ).set_defaults(func=cmd_eval_claims)
+
+    sub.add_parser("site", help="web app URL and user").set_defaults(func=cmd_site)
+    ak = sub.add_parser("ask", help="ask the Bedrock Agent copilot a question")
+    ak.add_argument("question")
+    ak.add_argument("--session", help="continue an earlier conversation")
+    ak.set_defaults(func=cmd_ask)
+    sub.add_parser("verify-clean", help="after cdk destroy: list anything left behind"
+                   ).set_defaults(func=cmd_verify_clean)
 
     lo = sub.add_parser("local", help="run generator + scoring offline")
     gen_args(lo)

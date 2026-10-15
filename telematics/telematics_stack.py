@@ -3,21 +3,27 @@
 Day 1: synthetic data generation and rule-based scoring.
 Day 2: score explainer API (API Gateway + Lambda + Bedrock + Guardrail).
 Day 3: crash -> claims workflow (EventBridge + Step Functions + Bedrock).
+Day 4: web app (CloudFront + S3, passcode) and an Amazon Bedrock Agent copilot.
 
 Every stateful resource uses RemovalPolicy.DESTROY (and the bucket empties
 itself) so `cdk destroy` leaves nothing behind in the account.
 """
 from __future__ import annotations
 
+import base64
+import os
 from pathlib import Path
 
 from aws_cdk import (
+    Annotations,
     CfnOutput,
     Duration,
     RemovalPolicy,
     Stack,
     aws_apigateway as apigw,
     aws_bedrock as bedrock,
+    aws_cloudfront as cloudfront,
+    aws_cloudfront_origins as origins,
     aws_dynamodb as dynamodb,
     aws_events as events,
     aws_events_targets as targets,
@@ -26,7 +32,9 @@ from aws_cdk import (
     aws_lambda_event_sources as lambda_events,
     aws_logs as logs,
     aws_s3 as s3,
+    aws_s3_deployment as s3deploy,
     aws_s3_notifications as s3n,
+    aws_secretsmanager as secretsmanager,
     aws_sqs as sqs,
     aws_stepfunctions as sfn,
     aws_stepfunctions_tasks as tasks,
@@ -34,11 +42,45 @@ from aws_cdk import (
 from constructs import Construct
 
 LAMBDA_DIR = Path(__file__).resolve().parent.parent / "lambdas"
+WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 EVENT_SOURCE = "telematics.scoring"
 ASSET_EXCLUDE = ["**/__pycache__", "*.pyc"]
 DEFAULT_MODEL_ID = "us.anthropic.claude-haiku-5-5"
 DEFAULT_STATEMENT_TIMEOUT_MINUTES = 30
 PROFILE_PREFIXES = ("us", "eu", "apac", "global", "jp", "au", "ca", "us-gov")
+DEFAULT_SITE_USER = "demo"
+DEFAULT_SITE_PASSWORD = "telematics-demo"
+
+AGENT_INSTRUCTION = """You are the Telematics Copilot for an auto insurer's member-service agents and claims adjusters. You answer questions about members' driving scores, trips, coaching explanations, and telematics-detected claims by calling the TelematicsData tools. All data is synthetic demo data.
+
+How to work:
+- Always look data up with the tools; never guess. If a driver or claim is not found, say so.
+- Driver ids look like DRV-0001 and claim ids look like CLM-1A2B3C4D. If the user gives a name, \
+call list_drivers to find the id.
+- Be concise: lead with the answer, then 2-5 short bullets with the specific numbers you used. \
+Always mention the driver or claim ids you looked at.
+- For claims, report the facts, triage, statement check, and draft status. The AI draft is for \
+an adjuster to review.
+
+Never discuss insurance premiums, prices, discounts, or what a member pays. Never determine or \
+suggest fault or liability, and never say whether a claim is covered, approved, or will be paid. \
+You are read-only: you cannot change scores, claims, or member data."""
+
+SITE_AUTH_JS = """function handler(event) {
+  var request = event.request;
+  var auth = request.headers.authorization;
+  if (!auth || auth.value !== '%s') {
+    return {
+      statusCode: 401,
+      statusDescription: 'Unauthorized',
+      headers: { 'www-authenticate': { value: 'Basic realm="Telematics demo"' } }
+    };
+  }
+  if (request.uri.indexOf('/api/') === 0) {
+    request.uri = request.uri.substring(4);
+  }
+  return request;
+}"""
 
 
 def foundation_model_id(model_id: str) -> str:
@@ -73,6 +115,7 @@ class TelematicsStack(Stack):
             partition_key=dynamodb.Attribute(name="driver_id", type=dynamodb.AttributeType.STRING),
             sort_key=dynamodb.Attribute(name="sk", type=dynamodb.AttributeType.STRING),
             billing_mode=dynamodb.BillingMode.PAY_PER_REQUEST,
+            time_to_live_attribute="expires_at",  # copilot jobs expire after a day
             removal_policy=RemovalPolicy.DESTROY,
         )
 
@@ -304,7 +347,17 @@ class TelematicsStack(Stack):
         driver.add_resource("score").add_method("GET", integration)
         driver.add_resource("explanation").add_method("GET", integration)
 
-        api_key = api.add_api_key("DemoApiKey", api_key_name=f"{self.stack_name}-demo-key")
+        # The key value lives in Secrets Manager so CloudFront can add it for the web app (Day 4)
+        # without it ever reaching the browser.
+        api_key_secret = secretsmanager.Secret(
+            self,
+            "ApiKeySecret",
+            description="API key used by CloudFront and scripts/demo.py for the telematics demo API",
+            generate_secret_string=secretsmanager.SecretStringGenerator(exclude_punctuation=True, password_length=40),
+            removal_policy=RemovalPolicy.DESTROY,
+        )
+        api_key = api.add_api_key("SiteApiKey", api_key_name=f"{self.stack_name}-key",
+                                  value=api_key_secret.secret_value.unsafe_unwrap())
         plan = api.add_usage_plan(
             "DemoUsagePlan",
             name=f"{self.stack_name}-demo-plan",
@@ -424,6 +477,210 @@ class TelematicsStack(Stack):
         claim.add_method("GET", integration)
         claim.add_resource("statement").add_method("POST", integration)
 
+        # ------------------------------------------------------------------ Day 4: Bedrock Agent copilot
+        agent_tools_fn = lambda_.Function(
+            self,
+            "AgentToolsFn",
+            code=lambda_.Code.from_asset(str(LAMBDA_DIR / "api"), exclude=ASSET_EXCLUDE),
+            handler="agent_tools.handler",
+            runtime=lambda_.Runtime.PYTHON_3_13,
+            architecture=lambda_.Architecture.ARM_64,
+            layers=[shared_layer],
+            memory_size=512,
+            timeout=Duration.seconds(60),
+            description="Copilot agent action group: read-only telematics and claims tools",
+            environment={
+                "TABLE_NAME": table.table_name,
+                "MODEL_ID": model_id,
+                "GUARDRAIL_ID": guardrail.attr_guardrail_id,
+                "GUARDRAIL_VERSION": guardrail_version.attr_version,
+            },
+            log_group=log_group("AgentTools"),
+        )
+        table.grant_read_write_data(agent_tools_fn)  # write = explanation cache only
+        allow_claude(agent_tools_fn)
+
+        agent_role = iam.Role(
+            self,
+            "CopilotAgentRole",
+            role_name=f"AmazonBedrockExecutionRoleForAgents_{self.stack_name}"[:64],
+            assumed_by=iam.ServicePrincipal(
+                "bedrock.amazonaws.com",
+                conditions={
+                    "StringEquals": {"aws:SourceAccount": self.account},
+                    "ArnLike": {"aws:SourceArn": f"arn:{self.partition}:bedrock:{self.region}:{self.account}:agent/*"},
+                },
+            ),
+            description="Execution role for the telematics copilot Bedrock Agent",
+        )
+        profile_arn = self.format_arn(service="bedrock", resource="inference-profile", resource_name=model_id)
+        agent_role.add_to_policy(iam.PolicyStatement(
+            actions=["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+            resources=[profile_arn,
+                       f"arn:{self.partition}:bedrock:*::foundation-model/{foundation_model_id(model_id)}*"],
+        ))
+        agent_role.add_to_policy(iam.PolicyStatement(
+            actions=["bedrock:GetInferenceProfile"], resources=[profile_arn]))
+        agent_role.add_to_policy(iam.PolicyStatement(
+            actions=["bedrock:ApplyGuardrail", "bedrock:GetGuardrail"],
+            resources=[guardrail.attr_guardrail_arn, f"{guardrail.attr_guardrail_arn}:*"],
+        ))
+
+        def tool(name: str, description: str, **params: tuple[str, str, bool]):
+            return bedrock.CfnAgent.FunctionProperty(
+                name=name,
+                description=description,
+                parameters={p: bedrock.CfnAgent.ParameterDetailProperty(type=t, description=d, required=r)
+                            for p, (t, d, r) in params.items()} or None,
+            )
+
+        driver_param = ("string", "Driver id, for example DRV-0020", True)
+        agent = bedrock.CfnAgent(
+            self,
+            "CopilotAgent",
+            agent_name=f"{self.stack_name}-copilot",
+            description="Read-only copilot over telematics scores, trips, explanations, and claims",
+            agent_resource_role_arn=agent_role.role_arn,
+            foundation_model=model_id,
+            instruction=AGENT_INSTRUCTION,
+            idle_session_ttl_in_seconds=900,
+            auto_prepare=True,
+            skip_resource_in_use_check_on_delete=True,
+            guardrail_configuration=bedrock.CfnAgent.GuardrailConfigurationProperty(
+                guardrail_identifier=guardrail.attr_guardrail_id,
+                guardrail_version=guardrail_version.attr_version,
+            ),
+            action_groups=[bedrock.CfnAgent.AgentActionGroupProperty(
+                action_group_name="TelematicsData",
+                description="Read-only lookups over drivers, trips, score explanations, and claims",
+                action_group_state="ENABLED",
+                action_group_executor=bedrock.CfnAgent.ActionGroupExecutorProperty(lambda_=agent_tools_fn.function_arn),
+                function_schema=bedrock.CfnAgent.FunctionSchemaProperty(functions=[
+                    tool("list_drivers", "List every driver with id, name, metro, latest weekly score, band, "
+                                         "and change versus the previous week."),
+                    tool("get_driver_score", "Weekly scores for one driver, with the points lost per factor.",
+                         driver_id=driver_param),
+                    tool("get_driver_trips", "A driver's most recent trips (newest first) with score, miles, "
+                                             "points lost per factor, and event counts.",
+                         driver_id=driver_param,
+                         limit=("integer", "How many trips, 1 to 25 (default 10)", False)),
+                    tool("get_score_explanation", "The plain-English explanation and coaching tips for a "
+                                                  "driver's latest weekly score.", driver_id=driver_param),
+                    tool("list_claims", "Claims opened from telematics crash detection, newest first.",
+                         status=("string", "Optional filter: awaiting_statement, drafting, "
+                                           "draft_ready_for_adjuster, or closed_false_alarm", False)),
+                    tool("get_claim", "One claim: crash facts, triage, member statement, statement checks, "
+                                      "and the FNOL draft.",
+                         claim_id=("string", "Claim id, for example CLM-1A2B3C4D", True)),
+                ]),
+            )],
+        )
+        agent.node.add_dependency(agent_role)  # the role's policy must exist before the agent is prepared
+        agent_tools_fn.add_permission(
+            "AllowCopilotAgent",
+            principal=iam.ServicePrincipal("bedrock.amazonaws.com"),
+            action="lambda:InvokeFunction",
+            source_arn=agent.attr_agent_arn,
+            source_account=self.account,
+        )
+
+        copilot_worker_fn = lambda_.Function(
+            self,
+            "CopilotWorkerFn",
+            code=lambda_.Code.from_asset(str(LAMBDA_DIR / "api"), exclude=ASSET_EXCLUDE),
+            handler="copilot_worker.handler",
+            runtime=lambda_.Runtime.PYTHON_3_13,
+            architecture=lambda_.Architecture.ARM_64,
+            memory_size=256,
+            timeout=Duration.minutes(3),
+            description="Copilot: runs a question through the Bedrock Agent and stores the answer",
+            # TSTALIASID is the built-in alias for the agent's working draft, which auto_prepare keeps
+            # current on every deploy (a versioned alias would need a new version per change).
+            environment={"TABLE_NAME": table.table_name, "AGENT_ID": agent.attr_agent_id,
+                         "AGENT_ALIAS_ID": "TSTALIASID"},
+            log_group=log_group("CopilotWorker"),
+        )
+        table.grant_read_write_data(copilot_worker_fn)
+        copilot_worker_fn.add_to_role_policy(iam.PolicyStatement(
+            actions=["bedrock:InvokeAgent"],
+            resources=[f"arn:{self.partition}:bedrock:{self.region}:{self.account}:agent-alias/"
+                       f"{agent.attr_agent_id}/*"],
+        ))
+        copilot_worker_fn.grant_invoke(api_fn)
+        api_fn.add_environment("COPILOT_WORKER_FUNCTION", copilot_worker_fn.function_name)
+
+        copilot = api.root.add_resource("copilot")
+        copilot.add_method("POST", integration)
+        copilot.add_resource("{job_id}").add_method("GET", integration)
+
+        # ------------------------------------------------------------------ Day 4: web app
+        site_user = self.node.try_get_context("site_user") or DEFAULT_SITE_USER
+        site_password = self.node.try_get_context("site_password") or os.environ.get("SITE_PASSWORD")
+        if not site_password:
+            site_password = DEFAULT_SITE_PASSWORD
+            Annotations.of(self).add_warning(
+                "Using the default web passcode. Set your own: cdk deploy -c site_password=...")
+        basic = base64.b64encode(f"{site_user}:{site_password}".encode()).decode()
+
+        site_bucket = s3.Bucket(
+            self,
+            "SiteBucket",
+            block_public_access=s3.BlockPublicAccess.BLOCK_ALL,
+            encryption=s3.BucketEncryption.S3_MANAGED,
+            enforce_ssl=True,
+            removal_policy=RemovalPolicy.DESTROY,
+            auto_delete_objects=True,
+        )
+        site_auth = cloudfront.Function(
+            self,
+            "SiteAuthFn",
+            code=cloudfront.FunctionCode.from_inline(SITE_AUTH_JS % f"Basic {basic}"),
+            runtime=cloudfront.FunctionRuntime.JS_2_0,
+            comment="Passcode for the telematics demo and /api prefix rewrite",
+        )
+        protect = [cloudfront.FunctionAssociation(function=site_auth,
+                                                  event_type=cloudfront.FunctionEventType.VIEWER_REQUEST)]
+        api_origin_policy = cloudfront.OriginRequestPolicy(
+            self,
+            "ApiOriginRequestPolicy",
+            comment="Forward query strings and Content-Type only (no Host, no Authorization)",
+            header_behavior=cloudfront.OriginRequestHeaderBehavior.allow_list("Content-Type"),
+            query_string_behavior=cloudfront.OriginRequestQueryStringBehavior.all(),
+            cookie_behavior=cloudfront.OriginRequestCookieBehavior.none(),
+        )
+        distribution = cloudfront.Distribution(
+            self,
+            "SiteDistribution",
+            comment=f"{self.stack_name} demo web app",
+            default_root_object="index.html",
+            price_class=cloudfront.PriceClass.PRICE_CLASS_100,
+            default_behavior=cloudfront.BehaviorOptions(
+                origin=origins.S3BucketOrigin.with_origin_access_control(site_bucket),
+                viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+                cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,  # always serve the latest demo build
+                function_associations=protect,
+            ),
+            additional_behaviors={
+                "/api/*": cloudfront.BehaviorOptions(
+                    origin=origins.RestApiOrigin(
+                        api, custom_headers={"x-api-key": api_key_secret.secret_value.unsafe_unwrap()}),
+                    viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.HTTPS_ONLY,
+                    allowed_methods=cloudfront.AllowedMethods.ALLOW_ALL,
+                    cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
+                    origin_request_policy=api_origin_policy,
+                    function_associations=protect,
+                ),
+            },
+        )
+        s3deploy.BucketDeployment(
+            self,
+            "DeploySite",
+            sources=[s3deploy.Source.asset(str(WEB_DIR))],
+            destination_bucket=site_bucket,
+            distribution=distribution,
+            distribution_paths=["/*"],
+        )
+
         # ------------------------------------------------------------------ outputs
         CfnOutput(self, "RawBucketName", value=raw_bucket.bucket_name)
         CfnOutput(self, "TableName", value=table.table_name)
@@ -439,3 +696,6 @@ class TelematicsStack(Stack):
         CfnOutput(self, "BedrockModelId", value=model_id)
         CfnOutput(self, "GuardrailId", value=guardrail.attr_guardrail_id)
         CfnOutput(self, "ClaimsStateMachineArn", value=claims_machine.state_machine_arn)
+        CfnOutput(self, "SiteUrl", value=f"https://{distribution.distribution_domain_name}")
+        CfnOutput(self, "SiteUser", value=site_user)
+        CfnOutput(self, "CopilotAgentId", value=agent.attr_agent_id)

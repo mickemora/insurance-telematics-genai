@@ -16,7 +16,7 @@ def template():
 
 
 def test_bucket_is_private_and_auto_deletes(template):
-    template.resource_count_is("AWS::S3::Bucket", 1)
+    template.resource_count_is("AWS::S3::Bucket", 2)  # raw trips + web site
     template.has_resource("AWS::S3::Bucket", {"DeletionPolicy": "Delete", "UpdateReplacePolicy": "Delete"})
     template.has_resource_properties("AWS::S3::Bucket", {
         "PublicAccessBlockConfiguration": {
@@ -24,7 +24,7 @@ def test_bucket_is_private_and_auto_deletes(template):
             "IgnorePublicAcls": True, "RestrictPublicBuckets": True,
         }
     })
-    template.resource_count_is("Custom::S3AutoDeleteObjects", 1)
+    template.resource_count_is("Custom::S3AutoDeleteObjects", 2)
 
 
 def test_no_retained_resources(template):
@@ -59,7 +59,7 @@ def test_crash_rule(template):
 
 def test_api_requires_key_on_every_route(template):
     methods = template.find_resources("AWS::ApiGateway::Method")
-    assert sorted(m["Properties"]["HttpMethod"] for m in methods.values()) == ["GET"] * 5 + ["POST"]
+    assert sorted(m["Properties"]["HttpMethod"] for m in methods.values()) == ["GET"] * 6 + ["POST"] * 2
     assert all(m["Properties"]["ApiKeyRequired"] is True for m in methods.values())
     template.resource_count_is("AWS::ApiGateway::ApiKey", 1)
     template.has_resource_properties("AWS::ApiGateway::UsagePlan", {
@@ -100,7 +100,7 @@ def test_shared_layer_attached_to_scoring_and_api(template):
     template.resource_count_is("AWS::Lambda::LayerVersion", 1)
     with_layers = [f for f in template.find_resources("AWS::Lambda::Function").values()
                    if f["Properties"].get("Layers")]
-    assert len(with_layers) == 6  # scoring, API, and the four claims tasks
+    assert len(with_layers) == 7  # scoring, API, the four claims tasks, and the agent tools
 
 
 def test_foundation_model_id():
@@ -137,3 +137,37 @@ def test_draft_function_can_use_claude(template):
     assert sum(s.get("Action") == "bedrock:InvokeModel" for s in statements) >= 2  # API + draft
     assert any(s.get("Action") == "geo-places:ReverseGeocode" for s in statements)
     assert any("states:SendTaskSuccess" in json.dumps(s.get("Action")) for s in statements)
+
+
+def test_copilot_agent(template):
+    template.resource_count_is("AWS::Bedrock::Agent", 1)
+    agent = list(template.find_resources("AWS::Bedrock::Agent").values())[0]["Properties"]
+    assert agent["FoundationModel"] == "us.anthropic.claude-haiku-5-5"
+    assert agent["AutoPrepare"] is True and "GuardrailConfiguration" in agent
+    group = agent["ActionGroups"][0]
+    names = {f["Name"] for f in group["FunctionSchema"]["Functions"]}
+    assert names == {"list_drivers", "get_driver_score", "get_driver_trips", "get_score_explanation",
+                     "list_claims", "get_claim"}
+    assert "Never determine or" in agent["Instruction"]
+    template.has_resource_properties("AWS::Lambda::Permission", {
+        "Principal": "bedrock.amazonaws.com", "Action": "lambda:InvokeFunction"})
+
+
+def test_web_app_behind_cloudfront_with_passcode(template):
+    template.resource_count_is("AWS::CloudFront::Distribution", 1)
+    dist = list(template.find_resources("AWS::CloudFront::Distribution").values())[0]["Properties"]
+    config = dist["DistributionConfig"]
+    api_behavior = [b for b in config["CacheBehaviors"] if b["PathPattern"] == "/api/*"][0]
+    assert api_behavior["FunctionAssociations"] and config["DefaultCacheBehavior"]["FunctionAssociations"]
+    fn = list(template.find_resources("AWS::CloudFront::Function").values())[0]["Properties"]
+    assert "www-authenticate" in fn["FunctionCode"] and "substring(4)" in fn["FunctionCode"]
+    headers = json.dumps(config["Origins"])
+    assert "x-api-key" in headers and "secretsmanager" in headers  # key injected at the edge, from the secret
+
+
+def test_site_password_from_context():
+    import base64
+    app = cdk.App(context={"site_user": "exec", "site_password": "s3cret-pass"})
+    t = Template.from_stack(TelematicsStack(app, "PwStack"))
+    code = list(t.find_resources("AWS::CloudFront::Function").values())[0]["Properties"]["FunctionCode"]
+    assert "Basic " + base64.b64encode(b"exec:s3cret-pass").decode() in code
