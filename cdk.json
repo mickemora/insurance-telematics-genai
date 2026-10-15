@@ -1,21 +1,28 @@
 {
   "app": "python3 app.py",
   "watch": {
-    "include": ["**"],
+    "include": [
+      "**"
+    ],
     "exclude": [
       "README.md",
       "cdk*.json",
       "requirements*.txt",
       "**/__pycache__",
       "tests",
-      "local_data"
+      "local_data",
+      "scripts"
     ]
   },
   "context": {
     "project": "insurance-telematics-genai",
+    "bedrock_model_id": "us.anthropic.claude-haiku-5-5",
     "@aws-cdk/aws-lambda:recognizeLayerVersion": true,
     "@aws-cdk/core:checkSecretUsage": true,
-    "@aws-cdk/core:target-partitions": ["aws", "aws-cn"],
+    "@aws-cdk/core:target-partitions": [
+      "aws",
+      "aws-cn"
+    ],
     "@aws-cdk/aws-iam:minimizePolicies": true,
     "@aws-cdk/aws-s3:createDefaultLoggingPolicy": true,
     "@aws-cdk/aws-s3:serverAccessLogsUseBucketPolicy": true,

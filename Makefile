@@ -1,4 +1,4 @@
-.PHONY: install test synth deploy destroy generate scores trips local
+.PHONY: install test synth deploy destroy generate scores explain eval local
 
 PY ?= python3
 
@@ -24,6 +24,15 @@ generate:
 # Weekly scores for every driver
 scores:
 	$(PY) scripts/demo.py scores
+
+# Day 2: AI explanation for one driver (make explain DRIVER=DRV-0003)
+DRIVER ?= DRV-0020
+explain:
+	$(PY) scripts/demo.py explain $(DRIVER)
+
+# Day 2: explain every driver and check against the hidden ground truth
+eval:
+	$(PY) scripts/demo.py eval
 
 # Generate + score locally without AWS (writes to ./local_data)
 local:

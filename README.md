@@ -6,8 +6,8 @@ is defined in **AWS CDK (Python)**, and uses **synthetic data only**.
 
 | Day | Feature | Status |
 |-----|---------|--------|
-| 1 | Foundation: synthetic trip generator, rule-based scoring, weekly aggregates | ✅ this commit |
-| 2 | Score explainer and coach (Bedrock) behind an API | planned |
+| 1 | Foundation: synthetic trip generator, rule-based scoring, weekly aggregates | ✅ done |
+| 2 | Score explainer and coach (Claude on Bedrock + Guardrail) behind an API | ✅ done |
 | 3 | Possible crash → drafted claim (EventBridge + Step Functions + Bedrock) | planned (events already flowing) |
 | 4 | Demo UI, agent copilot, demo script | planned |
 
@@ -63,12 +63,66 @@ averaging trip scores. Possible crashes are not penalized; they go to claims.
 The trip write and the weekly `ADD` run in one transaction guarded by
 `attribute_not_exists`, so SQS redeliveries never double count.
 
+## Day 2: score explainer and coach
+
+```mermaid
+flowchart LR
+    C[Client / demo.py] -->|x-api-key| AG[API Gateway<br/>usage plan + throttling]
+    AG --> API[Driver API Lambda]
+    API -->|query driver| DDB[(DynamoDB)]
+    API -->|1. facts in Python| F[Fact sheet]
+    F -->|2. Converse, forced tool output| BR[Claude on Bedrock]
+    BR -->|3. validate numbers + factors| V{OK?}
+    V -->|4. ApplyGuardrail| GR[Bedrock Guardrail]
+    V -.->|no| FB[Template fallback]
+    GR -.->|intervened| FB
+    API -->|cache per driver/week/model| DDB
+```
+
+| Route | Gen AI | Returns |
+|---|---|---|
+| `GET /drivers` | no | every driver with latest weekly score and change |
+| `GET /drivers/{id}/score` | no | weekly scores, penalty breakdown, last 10 trips |
+| `GET /drivers/{id}/explanation[?refresh=true]` | yes | headline, summary, 2-3 tips, the facts used, and provenance |
+
+**Facts first.** `lambdas/shared/python/facts.py` computes everything the model
+may say: this week vs last week, points lost per factor, which factor moved
+most, *when* the top factor tends to happen (for example "weekday evening
+commute, 4-7 PM: 58% of hard braking on 30% of miles"), the two worst trips,
+and strengths. The model only puts these into words; it never calculates.
+
+**Three checks before anything reaches the driver:**
+
+1. *Structured output:* the Converse API forces a `submit_explanation` tool call
+   (headline, summary, tips with a factor enum).
+2. *Grounding in code:* every number in the headline and summary must match a
+   fact (rounding allowed), every tip must name a factor that actually cost
+   points, and pricing or fault language is rejected.
+3. *Bedrock Guardrail:* `ApplyGuardrail` on the output denies insurance pricing
+   promises and fault or legal advice, and filters harmful content.
+
+If any check fails, or Bedrock is unavailable, the API returns a deterministic
+template explanation with `source: "fallback"` and the reason, so the endpoint
+never returns unchecked text. Model explanations are cached in DynamoDB until the
+week's facts or the model change.
+
+**Model.** Defaults to `us.anthropic.claude-haiku-5-5` (set in `cdk.json`). Try
+another model without editing code:
+
+```bash
+cdk deploy -c bedrock_model_id=us.anthropic.claude-sonnet-5-5
+```
+
+IAM is scoped to that inference profile and its foundation model only.
+
 ## Prerequisites
 
 - AWS account and credentials (`aws sts get-caller-identity` works)
 - Node.js 18+ and the CDK CLI: `npm install -g aws-cdk`
 - Python 3.11+
 - CDK bootstrapped once per account/region: `cdk bootstrap`
+- Day 2: access to the Claude model in Amazon Bedrock for your region (check with
+  `aws bedrock list-inference-profiles`)
 
 ## Deploy, run, destroy
 
@@ -84,6 +138,10 @@ make scores      # weekly score per driver
 python scripts/demo.py trips DRV-0020   # one driver's trips + penalty breakdown
 python scripts/demo.py crashes          # possible crashes (real and false alarms)
 
+make explain DRIVER=DRV-0020            # Day 2: AI explanation and coaching
+python scripts/demo.py explain DRV-0003 --facts   # ...plus the facts sent to the model
+make eval                               # explain every driver, check against hidden personas
+
 cdk destroy      # removes everything, including bucket contents and logs
 ```
 
@@ -95,8 +153,10 @@ JSON to `./local_data`, and prints weekly scores next to the hidden personas.
 
 ## Cost
 
-Pay-per-use only: Lambda, S3, SQS, DynamoDB on-demand, EventBridge. A full
-generate run costs well under $0.10. Nothing runs between invocations, and
+Pay-per-use only: Lambda, S3, SQS, DynamoDB on-demand, EventBridge, API
+Gateway, Bedrock, and Guardrails. A full generate run costs well under $0.10.
+A full `make eval` (20 explanations of roughly 2,000 tokens each, plus 20
+guardrail checks) costs a few cents with Haiku. Nothing runs between invocations, and
 `cdk destroy` leaves nothing behind (the CDK bootstrap stack is shared and
 stays).
 
@@ -106,9 +166,11 @@ stays).
 app.py                       CDK app
 telematics/telematics_stack.py
 lambdas/generator/           synth.py (pure generator) + handler.py
-lambdas/scoring/             score.py (pure scoring) + handler.py
-scripts/demo.py              generate / scores / trips / crashes / local
-tests/                       pytest: scoring, generator, handlers (fakes), CDK template
+lambdas/scoring/             handler.py (S3 -> SQS -> score -> DynamoDB + EventBridge)
+lambdas/shared/python/       Lambda layer: score.py (scoring) + facts.py (explainer facts)
+lambdas/api/                 handler.py (routes) + explain.py (Bedrock, validation, fallback)
+scripts/demo.py              generate / scores / trips / crashes / explain / eval / local
+tests/                       pytest: scoring, generator, facts + explainer, handlers (fakes), CDK template
 ```
 
 All data is synthetic. Names, policies, and trips are generated and do not
