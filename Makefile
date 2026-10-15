@@ -1,4 +1,4 @@
-.PHONY: install test synth deploy destroy generate scores explain eval local
+.PHONY: install test synth deploy destroy generate scores explain eval claims eval-claims local
 
 PY ?= python3
 
@@ -33,6 +33,14 @@ explain:
 # Day 2: explain every driver and check against the hidden ground truth
 eval:
 	$(PY) scripts/demo.py eval
+
+# Day 3: claims opened by the crash workflow
+claims:
+	$(PY) scripts/demo.py claims
+
+# Day 3: triage + statement cross-check against the hidden ground truth (run right after `make generate`)
+eval-claims:
+	$(PY) scripts/demo.py eval-claims
 
 # Generate + score locally without AWS (writes to ./local_data)
 local:

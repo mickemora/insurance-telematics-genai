@@ -7,6 +7,10 @@
     python scripts/demo.py crashes             # trips that raised a possible crash
     python scripts/demo.py explain DRV-0020    # Day 2: gen AI score explanation via the API
     python scripts/demo.py eval                # Day 2: explain every driver, check against ground truth
+    python scripts/demo.py claims              # Day 3: claims opened by the crash workflow
+    python scripts/demo.py claim CLM-1A2B3C4D  # Day 3: one claim with its FNOL draft
+    python scripts/demo.py statement CLM-1A2B3C4D [--inconsistent | --text "..."]
+    python scripts/demo.py eval-claims         # Day 3: triage + statement checks vs ground truth
     python scripts/demo.py local               # same pipeline offline, no AWS needed
 
 AWS commands use your normal AWS credentials/region (AWS_PROFILE, AWS_REGION)
@@ -29,6 +33,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "lambdas" / "generator"))
 sys.path.insert(0, str(ROOT / "lambdas" / "shared" / "python"))
 
+from crash import simulate_statement  # noqa: E402
 from score import TOTAL_FIELDS, score_from_totals, score_trip  # noqa: E402
 from synth import generate as synth_generate  # noqa: E402
 
@@ -58,7 +63,16 @@ _API: dict[str, str] = {}
 
 
 def api_get(path: str, query: dict | None = None) -> dict:
-    """GET an API route with the demo API key (looked up once from the stack)."""
+    return api_request("GET", path, query)
+
+
+def api_post(path: str, body: dict) -> dict:
+    return api_request("POST", path, body=body)
+
+
+def api_request(method: str, path: str, query: dict | None = None, body: dict | None = None,
+                allow: tuple[int, ...] = ()) -> dict:
+    """Call an API route with the demo API key (looked up once from the stack)."""
     if not _API:
         out = stack_outputs()
         if "ApiUrl" not in out:
@@ -66,12 +80,17 @@ def api_get(path: str, query: dict | None = None) -> dict:
         key = _boto3().client("apigateway").get_api_key(apiKey=out["ApiKeyId"], includeValue=True)["value"]
         _API.update(url=out["ApiUrl"].rstrip("/"), key=key)
     url = f"{_API['url']}{path}" + (f"?{urllib.parse.urlencode(query)}" if query else "")
-    req = urllib.request.Request(url, headers={"x-api-key": _API["key"]})
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"x-api-key": _API["key"], "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=40) as resp:
             return json.loads(resp.read())
     except urllib.error.HTTPError as err:
-        sys.exit(f"GET {path} failed: HTTP {err.code} {err.read().decode()[:300]}")
+        text = err.read().decode()[:300]
+        if err.code in allow:
+            return {"_status": err.code, **json.loads(text or "{}")}
+        sys.exit(f"{method} {path} failed: HTTP {err.code} {text}")
 
 
 def _query_driver(table, driver_id: str) -> list[dict]:
@@ -313,6 +332,154 @@ def cmd_eval(args) -> None:
             print(f"  fallback {d['driver_id']}: {r['reason']}")
 
 
+# --------------------------------------------------------------------------- Day 3: claims
+
+def _wrap(text: str, indent: str = "  ", width: int = 92) -> str:
+    return textwrap.fill(text, width, initial_indent=indent, subsequent_indent=indent)
+
+
+def print_claim(c: dict) -> None:
+    f = c["crash_facts"]
+    i, loc = f["impact"], f["location"]
+    print(f"{c['claim_id']}  status={c['status']}  triage={c['triage_label']}  "
+          f"member={f['member']['first_name']} {f['member']['last_initial']}. ({c['member_driver_id']}, "
+          f"{f['member']['vehicle']})")
+    where = loc.get("address") or f"{loc['lat']}, {loc['lon']}"
+    print(f"  {f['detected_at_local']}  |  {where}")
+    print(f"  triage reasons: {'; '.join(c['triage_reasons'])}\n")
+    print("  Timeline (telematics):")
+    for row in f["timeline"]:
+        print(f"    {row['when']:<22} {row['what']}")
+    if c.get("member_message"):
+        print("\n  Message to member:")
+        print(_wrap(c["member_message"], "    "))
+    if c.get("statement"):
+        print("\n  Member statement:")
+        print(_wrap(f'"{c["statement"]}"', "    "))
+    for chk in c.get("statement_checks") or []:
+        mark = "ok  " if chk["consistent"] else "DIFF"
+        print(f"    [{mark}] {chk['aspect']}: says {chk['statement_says']}; data shows {chk['data_shows']}")
+    d = c.get("draft")
+    if not d:
+        if c["status"] == "awaiting_statement":
+            print(f"\n  Waiting for the member's statement (until {c.get('statement_deadline')}).")
+            print(f"  Try: python scripts/demo.py statement {c['claim_id']}   (add --inconsistent to test the cross-check)")
+        return
+    print("\n  FNOL draft for the adjuster")
+    print(_wrap(d["incident_summary"], "    "))
+    sa = d["statement_assessment"]
+    print(f"\n    Statement vs data: {sa['verdict'].replace('_', ' ').upper()}")
+    print(_wrap(sa["explanation"], "      "))
+    print("\n    Questions for the adjuster:")
+    for q in d["adjuster_questions"]:
+        print(_wrap(f"- {q}", "      "))
+    print("    Next steps:")
+    for st in d["next_steps"]:
+        print(_wrap(f"- {st}", "      "))
+    usage = d.get("usage") or {}
+    print(f"\n    source={d['source']}  model={d['model_id']}  guardrail={d['guardrail']}  "
+          f"tokens={usage.get('inputTokens', '-')}/{usage.get('outputTokens', '-')}  latency={d.get('latency_ms')}ms")
+    if d.get("fallback_reason"):
+        print(f"    fallback reason: {d['fallback_reason']}")
+
+
+def cmd_claims(args) -> None:
+    claims = api_get("/claims")["claims"]
+    if not claims:
+        print("No claims yet. Crashes from `make generate` open claims within about a minute.")
+        return
+    print(f"{'claim':<13} {'status':<25} {'triage':<19} {'member':<9} {'detected':<26} {'impact':<34} verdict")
+    for c in claims:
+        imp = c["impact"]
+        impact = f"{imp['force_g']} g, {imp['direction_label']}, {imp['speed_at_impact_mph']} mph"
+        print(f"{c['claim_id']:<13} {c['status']:<25} {c['triage_label']:<19} {c['member'] or '':<9} "
+              f"{c['detected_at_local'] or '':<26} {impact:<34} {c['verdict'] or '-'}")
+
+
+def cmd_claim(args) -> None:
+    print_claim(api_get(f"/claims/{args.claim_id}"))
+
+
+def _wait_for_status(claim_id: str, statuses: set[str], timeout_s: int = 120) -> dict:
+    deadline = time.time() + timeout_s
+    while True:
+        c = api_get(f"/claims/{claim_id}")
+        if c["status"] in statuses or time.time() > deadline:
+            return c
+        time.sleep(3)
+
+
+def cmd_statement(args) -> None:
+    claim = api_get(f"/claims/{args.claim_id}")
+    text = args.text or simulate_statement(claim["crash_facts"], truthful=not args.inconsistent)
+    print(f'Sending statement: "{text}"')
+    resp = api_request("POST", f"/claims/{args.claim_id}/statement", body={"statement": text}, allow=(409,))
+    if resp.get("_status") == 409:
+        sys.exit(resp.get("message"))
+    print("Waiting for the FNOL draft", end="", flush=True)
+    claim = _wait_for_status(args.claim_id, {"draft_ready_for_adjuster"})
+    print("\n")
+    print_claim(claim)
+
+
+def cmd_eval_claims(args) -> None:
+    manifest = _latest_ground_truth()
+    planted = {p["trip_id"]: p for p in manifest["planted_events"]}
+    print(f"Ground truth: {sum(p['kind'] == 'crash' for p in planted.values())} real crashes, "
+          f"{sum(p['kind'] == 'false_alarm' for p in planted.values())} false alarms.")
+    print("Waiting for the workflow to open claims", end="", flush=True)
+    deadline = time.time() + 180
+    while True:
+        claims = api_get("/claims")["claims"]
+        settled = [c for c in claims if c["status"] != "detected"]
+        if len(settled) >= len(planted) or time.time() > deadline:
+            break
+        print(".", end="", flush=True)
+        time.sleep(5)
+    print(f" {len(claims)} claims.\n")
+
+    expected_triage = {"crash": "likely_crash", "false_alarm": "likely_false_alarm"}
+    triage_ok = 0
+    for c in claims:
+        kind = planted.get(c["trip_id"], {}).get("kind", "not planted")
+        ok = expected_triage.get(kind) == c["triage"]
+        triage_ok += ok
+        print(f"  {c['claim_id']}  truth={kind:<12} triage={c['triage']:<19} {'ok' if ok else 'MISS'}")
+    print(f"Triage matches ground truth: {triage_ok}/{len(claims)}\n")
+
+    waiting = sorted((c for c in claims if c["status"] == "awaiting_statement"), key=lambda c: c["claim_id"])
+    if not waiting:
+        print("No claims are waiting for a statement, so the statement cross-check was skipped.")
+        print("Run `make generate` for fresh claims, then `make eval-claims` within the statement window.")
+        return
+    sent = []
+    for n, c in enumerate(waiting):
+        truthful = n % 2 == 0
+        facts = api_get(f"/claims/{c['claim_id']}")["crash_facts"]
+        text = simulate_statement(facts, truthful=truthful)
+        api_post(f"/claims/{c['claim_id']}/statement", {"statement": text})
+        sent.append((c["claim_id"], truthful))
+    print(f"Sent {len(sent)} statements (alternating truthful / inconsistent). Waiting for drafts ...\n")
+
+    rows = []
+    for claim_id, truthful in sent:
+        c = _wait_for_status(claim_id, {"draft_ready_for_adjuster"}, timeout_s=180)
+        d = c.get("draft") or {}
+        verdict = d.get("statement_assessment", {}).get("verdict", "none")
+        ok = verdict == "consistent" if truthful else verdict in ("inconsistent", "partially_consistent")
+        rows.append((claim_id, truthful, verdict, ok, d.get("source"), d.get("guardrail"), d.get("latency_ms"),
+                     d.get("fallback_reason")))
+    print(f"{'claim':<13} {'statement':<13} {'verdict':<21} {'check':<6} {'source':<9} {'guardrail':<11} ms")
+    for claim_id, truthful, verdict, ok, source, guard, ms, _ in rows:
+        print(f"{claim_id:<13} {'truthful' if truthful else 'inconsistent':<13} {verdict:<21} "
+              f"{'ok' if ok else 'MISS':<6} {source or '-':<9} {guard or '-':<11} {ms or '-'}")
+    print(f"\nVerdict matches the statement we sent: {sum(r[3] for r in rows)}/{len(rows)}")
+    print(f"Drafted by the model:                  {sum(r[4] == 'bedrock' for r in rows)}/{len(rows)}")
+    for r in rows:
+        if r[7]:
+            print(f"  fallback {r[0]}: {r[7]}")
+
+
 def cmd_local(args) -> None:
     data = synth_generate(drivers=args.drivers, days=args.days, seed=args.seed,
                           crashes=args.crashes, false_alarms=args.false_alarms)
@@ -381,6 +548,18 @@ def main() -> None:
     ev.add_argument("--limit", type=int, default=0)
     ev.add_argument("--cached", action="store_true", help="reuse cached explanations")
     ev.set_defaults(func=cmd_eval)
+
+    sub.add_parser("claims", help="claims opened by the crash workflow").set_defaults(func=cmd_claims)
+    cl = sub.add_parser("claim", help="one claim with its FNOL draft")
+    cl.add_argument("claim_id")
+    cl.set_defaults(func=cmd_claim)
+    st = sub.add_parser("statement", help="send a member statement and wait for the draft")
+    st.add_argument("claim_id")
+    st.add_argument("--inconsistent", action="store_true", help="send a statement that contradicts the data")
+    st.add_argument("--text", help="your own statement text")
+    st.set_defaults(func=cmd_statement)
+    sub.add_parser("eval-claims", help="check triage and statement cross-checks against ground truth"
+                   ).set_defaults(func=cmd_eval_claims)
 
     lo = sub.add_parser("local", help="run generator + scoring offline")
     gen_args(lo)

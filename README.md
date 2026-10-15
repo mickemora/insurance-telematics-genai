@@ -8,7 +8,7 @@ is defined in **AWS CDK (Python)**, and uses **synthetic data only**.
 |-----|---------|--------|
 | 1 | Foundation: synthetic trip generator, rule-based scoring, weekly aggregates | ✅ done |
 | 2 | Score explainer and coach (Claude on Bedrock + Guardrail) behind an API | ✅ done |
-| 3 | Possible crash → drafted claim (EventBridge + Step Functions + Bedrock) | planned (events already flowing) |
+| 3 | Possible crash → triage → member statement → FNOL draft (EventBridge + Step Functions + Bedrock) | ✅ done |
 | 4 | Demo UI, agent copilot, demo script | planned |
 
 ## Architecture (Day 1)
@@ -115,6 +115,58 @@ cdk deploy -c bedrock_model_id=us.anthropic.claude-sonnet-5-5
 
 IAM is scoped to that inference profile and its foundation model only.
 
+## Day 3: crash to claim draft
+
+```mermaid
+flowchart LR
+    SC[Scoring Lambda] -->|PossibleCrashDetected| EB{{EventBridge}}
+    EB --> E[Enrich: crash facts,<br/>street address, triage]
+    E --> T{Triage}
+    T -->|likely false alarm| FA[Close + 'we noticed a jolt' message]
+    T -->|likely crash / needs review| W[Ask member for statement<br/>waitForTaskToken]
+    M[Member: POST /claims/id/statement] -.->|SendTaskSuccess| W
+    W -->|statement or timeout| D[Draft FNOL with Claude<br/>checks + Guardrail]
+    D --> DB[(Claim: draft ready for adjuster)]
+```
+
+The workflow is a Step Functions **Standard** state machine, so every claim is
+a visual execution in the console.
+
+1. **Enrich.** Loads the raw trip from S3 and computes crash facts in Python
+   from the 1 Hz window around the impact: speed 5 seconds before and at impact,
+   whether and when braking started, impact force and direction, how long the
+   vehicle stayed stopped, local time, and a street address from Amazon
+   Location (Places API, no resource to manage). The driving score is
+   deliberately left out of the claim.
+2. **Triage (rules, not AI).** *Likely crash*: high-force impact, then the
+   vehicle stopped and stayed stopped. *Likely false alarm*: a spike while
+   the vehicle kept moving at speed (phone dropped in the footwell). False
+   alarms are closed with a short member message.
+3. **Member check-in.** The workflow parks a task token and waits for
+   `POST /claims/{id}/statement`. With no answer within 30 minutes
+   (`-c statement_timeout_minutes=N`), it drafts anyway and the adjuster sees
+   "no statement".
+4. **FNOL draft.** Deterministic `statement_checks` compare what the member
+   says with the data (speed, impact direction, braking). Claude writes the
+   incident summary, a statement-vs-data verdict with the specific data
+   points, questions for the adjuster, and next steps. Code rejects numbers
+   that are not in the facts or the statement, any "consistent" verdict that
+   contradicts a failed check, and fault, liability, or payout language. The
+   Bedrock Guardrail runs on the output, and a template draft is the fallback.
+
+The model drafts and an adjuster decides. Nothing determines fault, coverage,
+or payment.
+
+| Route | Purpose |
+|---|---|
+| `GET /claims` | claims with status, triage, and verdict |
+| `GET /claims/{id}` | crash facts, timeline, member message, statement, checks, FNOL draft |
+| `POST /claims/{id}/statement` | `{"statement": "..."}` resumes the waiting workflow |
+
+Claims live in the same table under partition key `CLAIMS`, with the claim id as
+the sort key. Claim ids derive from the trip id, so duplicate events never open
+two claims.
+
 ## Prerequisites
 
 - AWS account and credentials (`aws sts get-caller-identity` works)
@@ -142,6 +194,12 @@ make explain DRIVER=DRV-0020            # Day 2: AI explanation and coaching
 python scripts/demo.py explain DRV-0003 --facts   # ...plus the facts sent to the model
 make eval                               # explain every driver, check against hidden personas
 
+make claims                             # Day 3: claims opened by the crash workflow
+python scripts/demo.py claim CLM-XXXXXXXX
+python scripts/demo.py statement CLM-XXXXXXXX                 # truthful statement -> draft
+python scripts/demo.py statement CLM-XXXXXXXX --inconsistent  # contradicts the data -> flagged
+make eval-claims                        # triage + cross-check vs ground truth (right after generate)
+
 cdk destroy      # removes everything, including bucket contents and logs
 ```
 
@@ -154,9 +212,10 @@ JSON to `./local_data`, and prints weekly scores next to the hidden personas.
 ## Cost
 
 Pay-per-use only: Lambda, S3, SQS, DynamoDB on-demand, EventBridge, API
-Gateway, Bedrock, and Guardrails. A full generate run costs well under $0.10.
+Gateway, Bedrock, Guardrails, Step Functions, and Amazon Location. A full generate run costs well under $0.10.
 A full `make eval` (20 explanations of roughly 2,000 tokens each, plus 20
-guardrail checks) costs a few cents with Haiku. Nothing runs between invocations, and
+guardrail checks) costs a few cents with Haiku. A Day 3 run is a handful of
+state transitions, 3 reverse geocodes, and 3 claim drafts: well under $0.05. Nothing runs between invocations, and
 `cdk destroy` leaves nothing behind (the CDK bootstrap stack is shared and
 stays).
 
@@ -167,9 +226,11 @@ app.py                       CDK app
 telematics/telematics_stack.py
 lambdas/generator/           synth.py (pure generator) + handler.py
 lambdas/scoring/             handler.py (S3 -> SQS -> score -> DynamoDB + EventBridge)
-lambdas/shared/python/       Lambda layer: score.py (scoring) + facts.py (explainer facts)
+lambdas/shared/python/       Lambda layer: score.py, facts.py (explainer), crash.py (claims), llm.py (Bedrock)
 lambdas/api/                 handler.py (routes) + explain.py (Bedrock, validation, fallback)
-scripts/demo.py              generate / scores / trips / crashes / explain / eval / local
+lambdas/claims/              handlers.py (4 workflow tasks) + draft.py (FNOL draft, validation, fallback)
+scripts/demo.py              generate / scores / trips / crashes / explain / eval / claims / claim /
+                             statement / eval-claims / local
 tests/                       pytest: scoring, generator, facts + explainer, handlers (fakes), CDK template
 ```
 

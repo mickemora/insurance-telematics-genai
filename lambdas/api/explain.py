@@ -17,6 +17,7 @@ import time
 from typing import Any
 
 from facts import FACTORS, MIN_POINTS, allowed_numbers, number_is_grounded, numbers_in
+from llm import ValidationError, call_tool, guardrail_passes
 
 TOOL_NAME = "submit_explanation"
 GENERIC_TIP_MAX = 15  # small numbers allowed in tips ("a 3-second following distance")
@@ -83,10 +84,6 @@ TIP_LIBRARY = {
     "late_night": "Where you can, move late-night drives earlier in the evening when roads are better lit and drivers more alert.",
     "general": "Keep doing what you are doing: smooth starts, steady speeds, and the phone out of reach.",
 }
-
-
-class ValidationError(Exception):
-    pass
 
 
 # --------------------------------------------------------------------------- validation
@@ -172,29 +169,12 @@ def fallback_explanation(facts: dict) -> dict:
 # --------------------------------------------------------------------------- Bedrock
 
 def _call_model(bedrock, model_id: str, facts: dict) -> tuple[dict, dict]:
-    resp = bedrock.converse(
-        modelId=model_id,
-        system=[{"text": SYSTEM_PROMPT}],
-        messages=[{"role": "user", "content": [{"text": "Driver facts:\n" + json.dumps(facts, indent=1)}]}],
-        toolConfig={"tools": [TOOL_SPEC], "toolChoice": {"tool": {"name": TOOL_NAME}}},
-        inferenceConfig={"maxTokens": 800, "temperature": 0.3},
-    )
-    blocks = resp.get("output", {}).get("message", {}).get("content", [])
-    tool = next((b["toolUse"] for b in blocks if "toolUse" in b), None)
-    if not tool or tool.get("name") != TOOL_NAME:
-        raise ValidationError(f"model did not call {TOOL_NAME} (stopReason={resp.get('stopReason')})")
-    return tool["input"], resp.get("usage", {})
+    return call_tool(bedrock, model_id, SYSTEM_PROMPT, "Driver facts:\n" + json.dumps(facts, indent=1), TOOL_SPEC)
 
 
 def _apply_guardrail(bedrock, guardrail_id: str, guardrail_version: str, explanation: dict) -> str:
-    text = "\n".join([explanation["headline"], explanation["summary"], *(t["tip"] for t in explanation["tips"])])
-    resp = bedrock.apply_guardrail(
-        guardrailIdentifier=guardrail_id,
-        guardrailVersion=guardrail_version,
-        source="OUTPUT",
-        content=[{"text": {"text": text}}],
-    )
-    return resp.get("action", "NONE")
+    texts = [explanation["headline"], explanation["summary"], *(t["tip"] for t in explanation["tips"])]
+    return "NONE" if guardrail_passes(bedrock, guardrail_id, guardrail_version, texts) else "GUARDRAIL_INTERVENED"
 
 
 def explain(facts: dict, bedrock, model_id: str, guardrail_id: str | None = None,
@@ -204,8 +184,7 @@ def explain(facts: dict, bedrock, model_id: str, guardrail_id: str | None = None
     meta: dict[str, Any] = {"source": "bedrock", "model_id": model_id, "guardrail": "not_configured",
                             "usage": {}, "fallback_reason": None}
     try:
-        explanation, usage = _call_model(bedrock, model_id, facts)
-        meta["usage"] = {k: usage.get(k) for k in ("inputTokens", "outputTokens") if k in usage}
+        explanation, meta["usage"] = _call_model(bedrock, model_id, facts)
         validate(explanation, facts)
         if guardrail_id:
             action = _apply_guardrail(bedrock, guardrail_id, guardrail_version or "DRAFT", explanation)

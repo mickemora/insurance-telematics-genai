@@ -4,6 +4,9 @@ GET /drivers                        all drivers with their latest weekly score
 GET /drivers/{driver_id}/score      weekly scores, penalty breakdown, recent trips (no gen AI)
 GET /drivers/{driver_id}/explanation[?refresh=true]
                                     gen AI explanation and coaching, cached per driver/week/model
+GET  /claims                        claims opened by the crash workflow (Day 3)
+GET  /claims/{claim_id}             one claim: crash facts, triage, statement, FNOL draft
+POST /claims/{claim_id}/statement   member statement {"statement": "..."}; resumes the workflow
 """
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ from datetime import datetime, timezone
 
 import boto3
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
 from explain import explain
 from facts import build_facts, facts_hash, plain, select_weeks
@@ -27,12 +31,15 @@ MODEL_ID = os.environ["MODEL_ID"]
 GUARDRAIL_ID = os.environ.get("GUARDRAIL_ID") or None
 GUARDRAIL_VERSION = os.environ.get("GUARDRAIL_VERSION") or None
 RECENT_TRIPS = 10
+CLAIMS_PK = "CLAIMS"
+MAX_STATEMENT_CHARS = 1000
 
 table = boto3.resource("dynamodb").Table(TABLE)
 bedrock = boto3.client(
     "bedrock-runtime",
     config=Config(read_timeout=25, connect_timeout=5, retries={"max_attempts": 2, "mode": "standard"}),
 )
+sfn = boto3.client("stepfunctions")
 
 
 # --------------------------------------------------------------------------- data access
@@ -167,13 +174,101 @@ def driver_explanation(driver_id: str, refresh: bool) -> dict:
     return _response(200, body)
 
 
+# --------------------------------------------------------------------------- claims (Day 3)
+
+CLAIM_SUMMARY_FIELDS = ("claim_id", "status", "triage", "triage_label", "member_driver_id", "trip_id",
+                        "created_at", "updated_at")
+
+
+def _claim_summary(c: dict) -> dict:
+    out = {k: c.get(k) for k in CLAIM_SUMMARY_FIELDS}
+    f = c.get("crash_facts", {})
+    out["member"] = f.get("member", {}).get("first_name")
+    out["detected_at_local"] = f.get("detected_at_local")
+    out["impact"] = {k: f.get("impact", {}).get(k) for k in ("force_g", "direction_label", "speed_at_impact_mph")}
+    out["verdict"] = (c.get("draft") or {}).get("statement_assessment", {}).get("verdict")
+    return out
+
+
+def list_claims() -> dict:
+    items, kwargs = [], {"KeyConditionExpression": "driver_id = :p", "ExpressionAttributeValues": {":p": CLAIMS_PK}}
+    while True:
+        resp = table.query(**kwargs)
+        items += resp["Items"]
+        if "LastEvaluatedKey" not in resp:
+            break
+        kwargs["ExclusiveStartKey"] = resp["LastEvaluatedKey"]
+    claims = sorted((_claim_summary(plain(i)) for i in items), key=lambda c: c["created_at"] or "", reverse=True)
+    return _response(200, {"claims": claims, "count": len(claims)})
+
+
+def get_claim(claim_id: str) -> dict:
+    item = table.get_item(Key={"driver_id": CLAIMS_PK, "sk": claim_id}).get("Item")
+    if not item:
+        return _response(404, {"message": f"claim {claim_id} not found"})
+    item = plain(item)
+    item.pop("task_token", None)
+    item.pop("driver_id", None)
+    item.pop("sk", None)
+    return _response(200, item)
+
+
+def post_statement(claim_id: str, raw_body: str | None) -> dict:
+    try:
+        statement = str(json.loads(raw_body or "{}").get("statement", "")).strip()
+    except (ValueError, AttributeError):
+        return _response(400, {"message": 'body must be JSON like {"statement": "..."}'})
+    if not statement:
+        return _response(400, {"message": "statement is required"})
+    if len(statement) > MAX_STATEMENT_CHARS:
+        return _response(400, {"message": f"statement is limited to {MAX_STATEMENT_CHARS} characters"})
+
+    key = {"driver_id": CLAIMS_PK, "sk": claim_id}
+    item = table.get_item(Key=key).get("Item")
+    if not item:
+        return _response(404, {"message": f"claim {claim_id} not found"})
+    if item.get("status") != "awaiting_statement" or not item.get("task_token"):
+        return _response(409, {"message": f"claim is {item.get('status')}; it is not waiting for a statement"})
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        # Save first (the draft step reads the statement from the table), then resume the workflow.
+        table.update_item(
+            Key=key,
+            UpdateExpression="SET statement = :st, statement_received_at = :now, #s = :drafting, updated_at = :now",
+            ConditionExpression="#s = :awaiting",
+            ExpressionAttributeNames={"#s": "status"},
+            ExpressionAttributeValues={":st": statement, ":now": now, ":drafting": "drafting",
+                                       ":awaiting": "awaiting_statement"},
+        )
+    except ClientError as err:
+        if err.response["Error"]["Code"] == "ConditionalCheckFailedException":
+            return _response(409, {"message": "claim is no longer waiting for a statement"})
+        raise
+    try:
+        sfn.send_task_success(taskToken=item["task_token"], output=json.dumps({"statement_received": True}))
+    except ClientError as err:
+        code = err.response["Error"]["Code"]
+        if code in ("TaskTimedOut", "TaskDoesNotExist", "InvalidToken"):
+            return _response(409, {"message": f"the workflow is no longer waiting ({code})"})
+        raise
+    return _response(202, {"claim_id": claim_id, "status": "drafting",
+                            "message": "Statement received; the FNOL draft is being prepared."})
+
+
 def handler(event, context):
     resource = event.get("resource", "")
     params = event.get("pathParameters") or {}
     query = event.get("queryStringParameters") or {}
+    method = event.get("httpMethod")
     try:
-        if event.get("httpMethod") != "GET":
+        if method == "POST" and resource == "/claims/{claim_id}/statement":
+            return post_statement(params["claim_id"], event.get("body"))
+        if method != "GET":
             return _response(405, {"message": "method not allowed"})
+        if resource == "/claims":
+            return list_claims()
+        if resource == "/claims/{claim_id}":
+            return get_claim(params["claim_id"])
         if resource == "/drivers":
             return list_drivers()
         if resource == "/drivers/{driver_id}/score":
